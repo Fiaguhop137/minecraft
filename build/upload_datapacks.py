@@ -20,7 +20,7 @@ from pathlib import Path
 # ============================================================
 
 CONFIG = Path("/home/firebot/git/minecraft/build/config.json")
-DATAPACKS_DIR = Path("/home/firebot/git/datapacks")
+DATAPACKS_DIR = Path("/home/firebot/git/minecraft")
 UPLOAD_DIR = Path("/home/firebot/git/minecraft/build/working_dir")
 BUILDER = Path("/home/firebot/git/minecraft/build/build_datapack.py")
 
