@@ -1,0 +1,13 @@
+{
+    "schemaVersion": 1,
+    "id": "bunnyboots",
+    "version": "26.2",
+    "name": "Bunny Boots",
+    "environment": "*",
+    "depends": {
+        "fabricloader": ">=0.18.4",
+        "minecraft": ">=26.2"
+    },
+    "entrypoints": {},
+    "mixins": []
+}

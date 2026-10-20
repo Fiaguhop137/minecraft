@@ -1,0 +1,16 @@
+{
+    "pack": {
+        "description": "Remove nasty Foliage and get more FPS! §8(v1.0.0-26.2)",
+        "pack_format": 48,
+        "supported_formats": [48,88],
+        "min_format":48,
+        "max_format":88,
+        "authors":[
+            {
+                "name":"Intensed",
+                "links":"https://modrinth.com/user/Intensed",
+                "used":"Everything else that isn't mentioned here"
+            }
+        ]
+    }
+}

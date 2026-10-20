@@ -1,0 +1,6 @@
+{
+  "parent": "meowpack:item/mortifer_eminus",
+  "textures": {
+    "layer0": "meowpack:item/mortifer_eminus_pulling_2"
+  }
+}

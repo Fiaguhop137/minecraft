@@ -1,0 +1,13 @@
+{
+    "schemaVersion": 1,
+    "id": "perpetua",
+    "version": "1.21.11",
+    "name": "Perpetua",
+    "environment": "*",
+    "depends": {
+        "fabricloader": ">=0.18.4",
+        "minecraft": ">=1.21.11"
+    },
+    "entrypoints": {},
+    "mixins": []
+}

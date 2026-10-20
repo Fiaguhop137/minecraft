@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:item/generated",
+  "textures": {
+    "layer0": "plasmatiara:item/plasma_tiara"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "show_notification": true,
+  "category": "equipment",
+  "pattern": [
+    "R R",
+    "R R"
+  ],
+  "key": {
+    "R": "minecraft:rabbit_hide"
+  },
+  "result": {
+    "id": "minecraft:leather_boots",
+    "components": {
+      "minecraft:max_damage": 225,
+      "minecraft:repairable": {
+        "items": "minecraft:rabbit_foot"
+      },
+      "minecraft:item_model": "bunnyboots:bunny_boots",
+      "minecraft:custom_name": {
+        "text": "Bunny Boots",
+        "type": "text",
+        "italic": false
+      },
+      "minecraft:dyed_color": 13016423,
+      "minecraft:attribute_modifiers": [
+        {
+          "type": "minecraft:step_height",
+          "id": "bunny_boots_step",
+          "amount": 0.65,
+          "operation": "add_value",
+          "slot": "feet"
+        },
+        {
+          "type": "minecraft:fall_damage_multiplier",
+          "id": "bunny_boots_soft_land",
+          "amount": -0.33,
+          "operation": "add_multiplied_total",
+          "slot": "feet"
+        },
+        {
+          "type": "minecraft:jump_strength",
+          "id": "bunny_boots_leap",
+          "amount": 0.06,
+          "operation": "add_value",
+          "slot": "feet"
+        }
+      ],
+      "minecraft:tooltip_display": {
+        "hidden_components": [
+          "minecraft:dyed_color"
+        ]
+      }
+    },
+    "count": 1
+  }
+}

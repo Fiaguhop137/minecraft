@@ -1,0 +1,29 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "show_notification": true,
+  "category": "equipment",
+  "pattern": [
+    "GRG",
+    "BWB"
+  ],
+  "key": {
+    "B": "minecraft:blaze_rod",
+    "G": "minecraft:gold_block",
+    "R": "minecraft:clock",
+    "W": "minecraft:wither_skeleton_skull"
+  },
+  "result": {
+    "id": "minecraft:golden_helmet",
+    "components": {
+      "minecraft:max_damage": 225,
+      "minecraft:repairable": {"items": "minecraft:gold_ingot"},
+      "minecraft:item_model": "plasmatiara:plasma_tiara",
+      "minecraft:equippable": {
+	  "slot": "head",
+	  "asset_id": "plasmatiara:plasma_tiara"
+      },
+      "minecraft:custom_name": {"text": "Plasma Tiara","type": "text","italic": false}
+    },
+    "count": 1
+  }
+}
