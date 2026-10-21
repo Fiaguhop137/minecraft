@@ -1,14 +1,19 @@
+
 #!/usr/bin/python3
 
 import concurrent.futures
 import hashlib
 import json
 import os
+import stat
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -19,6 +24,7 @@ from pathlib import Path
 
 CONFIG = Path("/home/firebot/git/minecraft/build/config.json")
 BUILDER = Path("/home/firebot/git/minecraft/build/build_resourcepack.py")
+UPLOAD_DIR = Path("/home/firebot/git/minecraft/build/working_dir")
 
 BUILD_JOBS = 8
 MAX_ATTEMPTS = 5
@@ -35,7 +41,7 @@ os.environ.update({
 
 
 # ============================================================
-# Helpers
+# General helpers
 # ============================================================
 
 def fail(message):
@@ -48,12 +54,8 @@ def format_id(pack_format):
     return str(pack_format)
 
 
-def load_json(path):
-    try:
-        with path.open("r", encoding="utf-8") as file:
-            return json.load(file)
-    except (OSError, json.JSONDecodeError) as error:
-        fail(f"Could not read JSON from {path}: {error}")
+def safe_name(name):
+    return name.replace("/", "_").replace(" ", "_")
 
 
 def sha512_file(path):
@@ -66,7 +68,22 @@ def sha512_file(path):
     return digest.hexdigest()
 
 
-def request(method, url, token, data=None, headers=None, timeout=REQUEST_TIMEOUT):
+def load_json(path):
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f"Could not read valid JSON from {path}: {error}")
+
+
+def request(
+    method,
+    url,
+    token,
+    data=None,
+    headers=None,
+    timeout=REQUEST_TIMEOUT,
+):
     request_headers = {
         "Authorization": token,
         "User-Agent": "Fiaguhop137-ResourcePack-Publisher/1.0",
@@ -90,10 +107,20 @@ def request(method, url, token, data=None, headers=None, timeout=REQUEST_TIMEOUT
         return error.code, dict(error.headers), error.read()
 
 
-def request_with_retries(method, url, token):
+def request_with_retries(
+    method,
+    url,
+    token,
+    timeout=REQUEST_TIMEOUT,
+):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            status, headers, body = request(method, url, token)
+            status, headers, body = request(
+                method,
+                url,
+                token,
+                timeout=timeout,
+            )
         except (OSError, urllib.error.URLError) as error:
             if attempt == MAX_ATTEMPTS:
                 raise RuntimeError(f"Request failed: {error}") from error
@@ -120,11 +147,211 @@ def request_with_retries(method, url, token):
 
 
 # ============================================================
+# Archive content comparison
+# ============================================================
+
+def extract_archive(archive, destination):
+    """Extract a ZIP while rejecting unsafe paths and special files."""
+    with zipfile.ZipFile(archive) as zipped:
+        for info in zipped.infolist():
+            name = info.filename
+
+            if not name or "\x00" in name:
+                continue
+
+            relative = Path(name)
+
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError(
+                    f"Unsafe path in archive {archive}: {name!r}"
+                )
+
+            target = destination / relative
+
+            mode = info.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+
+            if file_type not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise RuntimeError(
+                    f"Unsupported special file in archive: {name!r}"
+                )
+
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            if file_type == stat.S_IFDIR:
+                raise RuntimeError(
+                    f"Invalid directory entry in archive: {name!r}"
+                )
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            with zipped.open(info) as source, target.open("wb") as output:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+
+
+def hash_directory(directory):
+    """Hash relative file paths and contents, ignoring timestamps."""
+    digest = hashlib.sha512()
+
+    files = sorted(
+        path for path in directory.rglob("*")
+        if path.is_file()
+    )
+
+    for path in files:
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha512_file(path)))
+
+    return digest.hexdigest()
+
+
+def hash_archive_contents(archive, destination):
+    destination.mkdir(parents=True, exist_ok=False)
+    extract_archive(archive, destination)
+    return hash_directory(destination)
+
+
+def download_archive(url, destination):
+    """Download an existing Modrinth artifact."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Fiaguhop137-ResourcePack-Publisher/1.0",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
+        with destination.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+
+
+def download_archive_with_retries(url, destination):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            download_archive(url, destination)
+            return
+        except (OSError, urllib.error.URLError) as error:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            if attempt == MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Could not download existing artifact: {error}"
+                ) from error
+
+            print(
+                f"Download error: {error}. Retrying in 10 seconds."
+            )
+            time.sleep(10)
+
+
+def already_uploaded(existing_versions, local_archive, cache_dir):
+    """
+    Return True if an existing artifact has identical extracted contents.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    local_zip_hash = sha512_file(local_archive)
+    local_extract = cache_dir / "local-extracted"
+
+    local_content_hash = hash_archive_contents(
+        local_archive,
+        local_extract,
+    )
+
+    for version_index, version in enumerate(existing_versions):
+        if not isinstance(version, dict):
+            continue
+
+        files = version.get("files", [])
+
+        if not isinstance(files, list):
+            continue
+
+        for file_index, file_info in enumerate(files):
+            if not isinstance(file_info, dict):
+                continue
+
+            url = file_info.get("url")
+
+            if not isinstance(url, str) or not url.startswith(
+                ("https://", "http://")
+            ):
+                continue
+
+            hashes = file_info.get("hashes", {})
+            if not isinstance(hashes, dict):
+                hashes = {}
+
+            # Exact ZIP equality is a valid shortcut.
+            if hashes.get("sha512") == local_zip_hash:
+                return True
+
+            remote_zip = cache_dir / (
+                f"remote-{version_index}-{file_index}.zip"
+            )
+            remote_extract = cache_dir / (
+                f"remote-{version_index}-{file_index}-extracted"
+            )
+
+            print(
+                f"        Comparing existing artifact "
+                f"{version_index + 1}, file {file_index + 1}..."
+            )
+
+            try:
+                download_archive_with_retries(url, remote_zip)
+
+                remote_content_hash = hash_archive_contents(
+                    remote_zip,
+                    remote_extract,
+                )
+
+            except (
+                OSError,
+                RuntimeError,
+                urllib.error.URLError,
+                zipfile.BadZipFile,
+                zipfile.LargeZipFile,
+            ) as error:
+                fail(
+                    f"Could not verify existing artifact {url}: {error}"
+                )
+
+            if remote_content_hash == local_content_hash:
+                return True
+
+    return False
+
+
+# ============================================================
 # Multipart upload
 # ============================================================
 
-def upload_version(api_url, token, project_id, version_number,
-                   version_name, game_versions, archive):
+def upload_version(
+    api_url,
+    token,
+    project_id,
+    version_number,
+    version_name,
+    game_versions,
+    archive,
+):
     boundary = "----PythonModrinth" + uuid.uuid4().hex
 
     metadata = {
@@ -181,13 +408,15 @@ def upload_version(api_url, token, project_id, version_number,
         f"{api_url}/version",
         token,
         data=bytes(body),
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}"
+        },
         timeout=UPLOAD_TIMEOUT,
     )
 
 
 # ============================================================
-# Configuration validation
+# Load and validate configuration
 # ============================================================
 
 def load_config():
@@ -201,19 +430,15 @@ def load_config():
 
     token = config.get("TOKEN")
     api_url = config.get("MODRINTH_API")
-    upload_dir_value = config.get("UPLOAD_DIR")
     formats = config.get("resourcepack_formats")
 
     if not isinstance(token, str) or not token or token == "censored":
-        fail("Modrinth token is missing from config.json.")
+        fail("A valid Modrinth token is required in config.json.")
 
     if not isinstance(api_url, str) or not api_url.startswith(
         ("https://", "http://")
     ):
         fail("MODRINTH_API must be a valid HTTP(S) URL.")
-
-    if not isinstance(upload_dir_value, str) or not upload_dir_value:
-        fail("UPLOAD_DIR is missing from config.json.")
 
     if not isinstance(formats, dict) or not formats:
         fail("resourcepack_formats must be a nonempty object in config.json.")
@@ -238,31 +463,35 @@ def load_config():
         if not isinstance(version, str):
             fail("Minecraft version keys must be strings.")
 
-        if isinstance(pack_format, bool) or not isinstance(
-            pack_format, (int, list)
-        ):
-            fail(f"Invalid resource-pack format for {version}: {pack_format}")
-
-        if isinstance(pack_format, list) and (
-            not pack_format
-            or any(
-                isinstance(value, bool) or not isinstance(value, int)
-                for value in pack_format
+        if (
+            isinstance(pack_format, bool)
+            or not isinstance(pack_format, (int, list))
+            or (
+                isinstance(pack_format, list)
+                and (
+                    not pack_format
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in pack_format
+                    )
+                )
             )
         ):
-            fail(f"Invalid resource-pack format for {version}: {pack_format}")
+            fail(
+                f"Invalid resource-pack format for Minecraft "
+                f"{version}: {pack_format}"
+            )
 
-    upload_dir = Path(upload_dir_value)
-    upload_dir.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-    return config, token, api_url.rstrip("/"), formats, upload_dir
+    return config, token, api_url.rstrip("/"), formats
 
 
 # ============================================================
-# Build list
+# Create grouped build list
 # ============================================================
 
-def create_build_list(config, formats, upload_dir):
+def create_build_list(config, formats):
     print("\nCreating grouped build list...")
 
     grouped = {}
@@ -292,8 +521,8 @@ def create_build_list(config, formats, upload_dir):
             versions = group["versions"]
             representative = group["representative"]
 
-            archive = upload_dir / (
-                f"{project_name}-{format_id(pack_format)}.zip"
+            archive = UPLOAD_DIR / (
+                f"{safe_name(project_name)}-{format_id(pack_format)}.zip"
             )
 
             builds.append({
@@ -304,12 +533,13 @@ def create_build_list(config, formats, upload_dir):
                 ),
                 "representative": representative,
                 "versions": versions,
+                "versions_text": ",".join(versions),
                 "archive": archive,
             })
 
-    print(f"Resource-pack builds required: {len(builds)}")
-    print(f"Minecraft versions configured: {len(formats)}")
-    print(f"Parallel build jobs:            {BUILD_JOBS}")
+    print(f"Unique resource-pack builds: {len(builds)}")
+    print(f"Configured Minecraft versions: {len(formats)}")
+    print(f"Parallel build jobs: {BUILD_JOBS}")
 
     if not builds:
         fail("No resource-pack projects are configured.")
@@ -322,23 +552,25 @@ def create_build_list(config, formats, upload_dir):
 # ============================================================
 
 def build_one(build, config):
-    project_name = config["PROJECT_NAMES"][build["index"]]
+    index = build["index"]
+    project_name = config["PROJECT_NAMES"][index]
+    archive = build["archive"]
 
     command = [
         "/usr/bin/python3",
         str(BUILDER),
-        str(build["index"]),
+        str(index),
         build["format_arg"],
         build["representative"],
     ]
 
     try:
-        result = __import__("subprocess").run(
+        result = subprocess.run(
             command,
             cwd=str(BUILDER.parent),
-            stdout=__import__("subprocess").PIPE,
-            stderr=__import__("subprocess").STDOUT,
             text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             check=False,
         )
     except OSError as error:
@@ -359,22 +591,22 @@ def build_one(build, config):
             "error": f"Builder exited with status {result.returncode}.",
         }
 
-    if not build["archive"].is_file():
+    if not archive.is_file():
         return {
             "success": False,
             "build": build,
             "output": output,
-            "error": f"Builder did not create {build['archive']}",
+            "error": f"Builder did not create {archive}",
         }
 
     try:
-        digest = sha512_file(build["archive"])
+        digest = sha512_file(archive)
     except OSError as error:
         return {
             "success": False,
             "build": build,
             "output": output,
-            "error": f"Could not hash archive: {error}",
+            "error": f"Could not hash {archive}: {error}",
         }
 
     return {
@@ -387,6 +619,63 @@ def build_one(build, config):
 
 
 # ============================================================
+# Fetch existing Modrinth versions
+# ============================================================
+
+def fetch_versions(config, token, api_url, cache_dir):
+    print("\n" + "=" * 60)
+    print("FETCHING EXISTING MODRINTH VERSIONS")
+    print("=" * 60)
+
+    cache = {}
+
+    for index, project_type in enumerate(config["TYPE"]):
+        if project_type != "resourcepack":
+            continue
+
+        project_name = config["PROJECT_NAMES"][index]
+        project_id = config["PROJECT_IDS"][index]
+
+        print(f"\nFetching versions for {project_name}...")
+
+        status, _, body = request_with_retries(
+            "GET",
+            f"{api_url}/project/{project_id}/version",
+            token,
+        )
+
+        if status == 404:
+            versions = []
+        elif 200 <= status < 300:
+            try:
+                versions = json.loads(body)
+            except json.JSONDecodeError as error:
+                fail(f"Invalid JSON returned for {project_id}: {error}")
+
+            if not isinstance(versions, list):
+                fail(
+                    f"Unexpected versions response for project {project_id}."
+                )
+        else:
+            fail(
+                f"Modrinth returned HTTP {status} for {project_id}:\n"
+                f"{body.decode('utf-8', errors='replace')}"
+            )
+
+        cache[project_id] = versions
+
+        cache_file = cache_dir / f"{project_id}.json"
+        cache_file.write_text(
+            json.dumps(versions, indent=2),
+            encoding="utf-8",
+        )
+
+        print(f"Cached {project_name}: {len(versions)} existing version(s)")
+
+    return cache
+
+
+# ============================================================
 # Upload one build
 # ============================================================
 
@@ -395,10 +684,9 @@ def upload_one(build, config, token, api_url):
     project_name = config["PROJECT_NAMES"][index]
     project_id = config["PROJECT_IDS"][index]
     pack_format_id = format_id(build["format"])
-    versions = build["versions"]
 
     print(f"[UPLOAD] {project_name} format {pack_format_id}")
-    print(f"         Versions: {','.join(versions)}")
+    print(f"         Versions: {build['versions_text']}")
 
     version_number = (
         datetime.now().strftime("%Y%m%d%H%M%S")
@@ -412,11 +700,11 @@ def upload_one(build, config, token, api_url):
             project_id,
             version_number,
             f"Pack format {pack_format_id}",
-            versions,
+            build["versions"],
             build["archive"],
         )
     except (OSError, urllib.error.URLError) as error:
-        print(f"[ERROR] Upload request failed: {error}")
+        print(f"[ERROR] Upload request failed for {project_name}: {error}")
         return False
 
     if 200 <= status < 300:
@@ -436,140 +724,249 @@ def upload_one(build, config, token, api_url):
 # ============================================================
 
 def main():
-    config, token, api_url, formats, upload_dir = load_config()
-    builds = create_build_list(config, formats, upload_dir)
+    config, token, api_url, formats = load_config()
+    builds = create_build_list(config, formats)
 
-    # --------------------------------------------------------
-    # Build phase
-    # --------------------------------------------------------
+    with tempfile.TemporaryDirectory(
+        prefix="resourcepack-publisher-"
+    ) as temp:
+        temp_dir = Path(temp)
+        cache_dir = temp_dir / "modrinth"
+        comparison_dir = temp_dir / "comparison"
+        cache_dir.mkdir()
+        comparison_dir.mkdir()
 
-    print("\n" + "=" * 60)
-    print("BUILD PHASE")
-    print("=" * 60)
+        # ----------------------------------------------------
+        # Build phase
+        # ----------------------------------------------------
 
-    results_by_id = {}
+        print("\n" + "=" * 60)
+        print("BUILD PHASE")
+        print("=" * 60)
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=BUILD_JOBS
-    ) as executor:
-        futures = {
-            executor.submit(build_one, build, config): build
-            for build in builds
+        results = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=BUILD_JOBS
+        ) as executor:
+            futures = {
+                executor.submit(build_one, build, config): build
+                for build in builds
+            }
+
+            for future in concurrent.futures.as_completed(futures):
+                build = futures[future]
+
+                try:
+                    result = future.result()
+                except Exception as error:
+                    result = {
+                        "success": False,
+                        "build": build,
+                        "output": "",
+                        "error": str(error),
+                    }
+
+                if result["output"]:
+                    print(result["output"], end="")
+                    if not result["output"].endswith("\n"):
+                        print()
+
+                results.append(result)
+
+                project_name = config["PROJECT_NAMES"][build["index"]]
+
+                if result["success"]:
+                    print(
+                        f"[DONE ] {project_name} "
+                        f"{build['representative']} "
+                        f"(format {format_id(build['format'])})"
+                    )
+                else:
+                    print(f"[ERROR] {project_name}: {result['error']}")
+
+        failed_builds = [
+            result for result in results if not result["success"]
+        ]
+
+        if failed_builds:
+            fail(
+                f"{len(failed_builds)} build(s) failed. "
+                "No uploads were attempted."
+            )
+
+        results_by_build = {
+            id(result["build"]): result for result in results
         }
+        successful_builds = [
+            results_by_build[id(build)] for build in builds
+        ]
 
-        for future in concurrent.futures.as_completed(futures):
-            build = futures[future]
+        built_count = len(successful_builds)
+
+        print("\n" + "=" * 60)
+        print("BUILD PHASE COMPLETE")
+        print("=" * 60)
+        print(f"Unique builds: {built_count} / {len(builds)}")
+        print("=" * 60)
+
+        # ----------------------------------------------------
+        # Fetch existing versions once per project
+        # ----------------------------------------------------
+
+        cache = fetch_versions(config, token, api_url, cache_dir)
+
+        # ----------------------------------------------------
+        # Upload phase
+        # ----------------------------------------------------
+
+        print("\n" + "=" * 60)
+        print("UPLOAD PHASE")
+        print("=" * 60)
+
+        uploaded = 0
+        skipped = 0
+        failed_uploads = []
+
+        for result in successful_builds:
+            build = result["build"]
+            index = build["index"]
+            project_id = config["PROJECT_IDS"][index]
+            project_name = config["PROJECT_NAMES"][index]
+
+            build_compare_dir = comparison_dir / (
+                f"{index}-{format_id(build['format'])}"
+            )
 
             try:
-                result = future.result()
-            except Exception as error:
-                result = {
-                    "success": False,
-                    "build": build,
-                    "output": "",
-                    "error": str(error),
-                }
+                if already_uploaded(
+                    cache[project_id],
+                    build["archive"],
+                    build_compare_dir,
+                ):
+                    print(f"[SKIP ] {project_name}")
+                    print(f"        Format: {build['format']}")
+                    print(f"        Versions: {build['versions_text']}")
+                    print("        Identical contents already published.")
+                    skipped += 1
+                    continue
 
-            if result["output"]:
-                print(result["output"], end="")
-                if not result["output"].endswith("\n"):
-                    print()
-
-            results_by_id[id(build)] = result
-
-            project_name = config["PROJECT_NAMES"][build["index"]]
-
-            if result["success"]:
+            except (
+                RuntimeError,
+                OSError,
+                urllib.error.URLError,
+                zipfile.BadZipFile,
+                zipfile.LargeZipFile,
+            ) as error:
                 print(
-                    f"[DONE ] {project_name} "
-                    f"format {format_id(build['format'])}"
+                    f"[ERROR] Could not verify existing artifacts for "
+                    f"{project_name}: {error}"
                 )
-            else:
-                print(f"[ERROR] {project_name}: {result['error']}")
-
-    results = [results_by_id[id(build)] for build in builds]
-    failed_builds = [result for result in results if not result["success"]]
-
-    if failed_builds:
-        fail(
-            f"{len(failed_builds)} build(s) failed. "
-            "No uploads were attempted."
-        )
-
-    built_count = len(results)
-
-    print("\n" + "=" * 60)
-    print("BUILD PHASE COMPLETE")
-    print(f"Unique builds: {built_count} / {len(builds)}")
-    print("=" * 60)
-
-    # --------------------------------------------------------
-    # Upload phase
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 60)
-    print("UPLOAD PHASE")
-    print("=" * 60)
-
-    uploaded = 0
-    upload_failed = 0
-    retry_list = []
-
-    for result in results:
-        build = result["build"]
-
-        if upload_one(build, config, token, api_url):
-            uploaded += 1
-        else:
-            retry_list.append(build)
-
-    # --------------------------------------------------------
-    # Retry failed uploads once
-    # --------------------------------------------------------
-
-    if retry_list:
-        print("\n" + "=" * 60)
-        print("RETRYING FAILED UPLOADS")
-        print("=" * 60)
-        print(f"Uploads requiring retry: {len(retry_list)}")
-
-        for build in retry_list:
-            print("\n[RETRY] Retrying upload...")
+                failed_uploads.append(build)
+                continue
 
             if upload_one(build, config, token, api_url):
                 uploaded += 1
+
+                # Keep the local cache current for subsequent builds.
+                cache[project_id].append({
+                    "game_versions": build["versions"],
+                    "files": [{
+                        "url": None,
+                        "hashes": {
+                            "sha512": result["hash"],
+                        },
+                    }],
+                })
             else:
-                upload_failed += 1
+                failed_uploads.append(build)
 
-    # --------------------------------------------------------
-    # Cleanup generated ZIPs
-    # --------------------------------------------------------
+        # ----------------------------------------------------
+        # Retry failed uploads once
+        # ----------------------------------------------------
 
-    print("\nCleaning generated ZIPs...")
+        upload_failed = 0
 
-    for build in builds:
-        archive = build["archive"]
+        if failed_uploads:
+            print("\n" + "=" * 60)
+            print("RETRYING FAILED UPLOADS")
+            print("=" * 60)
+            print(f"Uploads requiring retry: {len(failed_uploads)}")
 
-        try:
-            if archive.is_file() or archive.is_symlink():
-                archive.unlink()
-        except OSError as error:
-            print(f"[WARNING] Could not delete {archive}: {error}")
+            for build in failed_uploads:
+                print("\n[RETRY] Rechecking and retrying upload...")
 
-    # --------------------------------------------------------
-    # Summary
-    # --------------------------------------------------------
+                index = build["index"]
+                project_id = config["PROJECT_IDS"][index]
+                project_name = config["PROJECT_NAMES"][index]
 
-    print("\n" + "=" * 60)
-    print("ALL RESOURCE PACKS PROCESSED")
-    print("=" * 60)
-    print(f"Minecraft versions: {len(formats)}")
-    print(f"Unique builds:      {built_count}")
-    print(f"Uploaded:           {uploaded}")
-    print(f"Failed:             {upload_failed}")
-    print("=" * 60)
+                retry_compare_dir = comparison_dir / (
+                    f"retry-{index}-{format_id(build['format'])}"
+                )
 
-    return 1 if upload_failed else 0
+                try:
+                    if already_uploaded(
+                        cache[project_id],
+                        build["archive"],
+                        retry_compare_dir,
+                    ):
+                        print(
+                            f"[SKIP ] {project_name}: identical contents "
+                            "already published."
+                        )
+                        skipped += 1
+                        continue
+
+                except (
+                    RuntimeError,
+                    OSError,
+                    urllib.error.URLError,
+                    zipfile.BadZipFile,
+                    zipfile.LargeZipFile,
+                ) as error:
+                    print(
+                        f"[ERROR] Could not verify before retrying "
+                        f"{project_name}: {error}"
+                    )
+                    upload_failed += 1
+                    continue
+
+                if upload_one(build, config, token, api_url):
+                    uploaded += 1
+                else:
+                    upload_failed += 1
+
+        # ----------------------------------------------------
+        # Cleanup generated ZIPs
+        # ----------------------------------------------------
+
+        print("\nCleaning generated ZIPs...")
+
+        for archive in UPLOAD_DIR.glob("*.zip"):
+            try:
+                if archive.is_file() or archive.is_symlink():
+                    archive.unlink()
+            except OSError as error:
+                print(f"[WARNING] Could not delete {archive}: {error}")
+
+        # ----------------------------------------------------
+        # Summary
+        # ----------------------------------------------------
+
+        print("\n" + "=" * 60)
+        print("ALL RESOURCE PACKS PROCESSED")
+        print("=" * 60)
+        print(f"Minecraft versions: {len(formats)}")
+        print(f"Unique builds:      {built_count}")
+        print(f"Uploaded:           {uploaded}")
+        print(f"Skipped:            {skipped}")
+        print(f"Failed:             {upload_failed}")
+        print("=" * 60)
+
+        if upload_failed:
+            return 1
+
+    return 0
 
 
 try:

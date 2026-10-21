@@ -1,9 +1,11 @@
+
 #!/usr/bin/python3
 
 import concurrent.futures
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -11,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +30,7 @@ BUILDER = Path("/home/firebot/git/minecraft/build/build_datapack.py")
 BUILD_JOBS = 8
 MAX_ATTEMPTS = 5
 TIMEOUT = 120
+UPLOAD_TIMEOUT = 300
 
 os.environ.update({
     "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
@@ -97,10 +101,12 @@ def request(method, url, token, data=None, headers=None, timeout=TIMEOUT):
         return error.code, dict(error.headers), error.read()
 
 
-def request_with_retries(method, url, token):
+def request_with_retries(method, url, token, timeout=TIMEOUT):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            status, headers, body = request(method, url, token)
+            status, headers, body = request(
+                method, url, token, timeout=timeout
+            )
         except (OSError, urllib.error.URLError) as error:
             if attempt == MAX_ATTEMPTS:
                 raise RuntimeError(f"Request failed: {error}") from error
@@ -127,11 +133,219 @@ def request_with_retries(method, url, token):
 
 
 # ============================================================
+# Archive content comparison
+# ============================================================
+
+def extract_archive(archive, destination):
+    """Safely extract an archive without preserving timestamps."""
+    with zipfile.ZipFile(archive) as zipped:
+        for info in zipped.infolist():
+            name = info.filename
+
+            if not name or "\x00" in name:
+                continue
+
+            relative = Path(name)
+
+            if relative.is_absolute() or ".." in relative.parts:
+                raise RuntimeError(
+                    f"Unsafe path in archive {archive}: {name!r}"
+                )
+
+            target = destination / relative
+
+            # Reject symlinks and other non-regular special file types.
+            mode = info.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+
+            if file_type not in (
+                0,
+                stat.S_IFREG,
+                stat.S_IFDIR,
+            ):
+                raise RuntimeError(
+                    f"Unsupported special file in archive: {name!r}"
+                )
+
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+
+            if file_type == stat.S_IFDIR:
+                raise RuntimeError(
+                    f"Invalid directory entry in archive: {name!r}"
+                )
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            with zipped.open(info) as source, target.open("wb") as output:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+
+
+def hash_directory(directory):
+    """Hash file paths and contents, ignoring archive metadata."""
+    digest = hashlib.sha512()
+
+    files = sorted(
+        path for path in directory.rglob("*")
+        if path.is_file()
+    )
+
+    for path in files:
+        relative = path.relative_to(directory).as_posix().encode("utf-8")
+
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(bytes.fromhex(sha512_file(path)))
+
+    return digest.hexdigest()
+
+
+def hash_archive_contents(archive, destination):
+    """Extract an archive and hash its canonical contents."""
+    destination.mkdir(parents=True, exist_ok=False)
+    extract_archive(archive, destination)
+    return hash_directory(destination)
+
+
+def download_archive(url, destination):
+    """Download a public Modrinth CDN artifact to disk."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Fiaguhop137-Datapack-Publisher/1.0",
+        },
+    )
+
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        with destination.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+
+
+def download_archive_with_retries(url, destination):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            download_archive(url, destination)
+            return
+        except (OSError, urllib.error.URLError) as error:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            if attempt == MAX_ATTEMPTS:
+                raise RuntimeError(
+                    f"Could not download existing artifact: {error}"
+                ) from error
+
+            print(
+                f"Download error: {error}. "
+                "Retrying in 10 seconds."
+            )
+            time.sleep(10)
+
+
+def already_uploaded(existing_versions, local_archive, cache_dir):
+    """
+    Return True if any existing project artifact has identical contents.
+
+    Existing artifact ZIP hashes are used as a quick shortcut. Otherwise,
+    both archives are extracted and their path/content hashes are compared.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    local_zip_hash = sha512_file(local_archive)
+
+    local_extract = cache_dir / "local-extracted"
+
+    local_content_hash = hash_archive_contents(
+        local_archive, local_extract
+    )
+
+    for version_index, version in enumerate(existing_versions):
+        if not isinstance(version, dict):
+            continue
+
+        files = version.get("files", [])
+
+        if not isinstance(files, list):
+            continue
+
+        for file_index, file_info in enumerate(files):
+            if not isinstance(file_info, dict):
+                continue
+
+            url = file_info.get("url")
+            if not isinstance(url, str) or not url.startswith(
+                ("https://", "http://")
+            ):
+                continue
+
+            hashes = file_info.get("hashes", {})
+            if not isinstance(hashes, dict):
+                hashes = {}
+
+            # Identical archive bytes guarantee identical archive contents.
+            if hashes.get("sha512") == local_zip_hash:
+                return True
+
+            remote_zip = cache_dir / (
+                f"remote-{version_index}-{file_index}.zip"
+            )
+            remote_extract = cache_dir / (
+                f"remote-{version_index}-{file_index}-extracted"
+            )
+
+            print(
+                f"        Comparing existing artifact "
+                f"{version_index + 1}, file {file_index + 1}..."
+            )
+
+            try:
+                download_archive_with_retries(url, remote_zip)
+
+                remote_content_hash = hash_archive_contents(
+                    remote_zip, remote_extract
+                )
+
+            except (
+                OSError,
+                RuntimeError,
+                urllib.error.URLError,
+                zipfile.BadZipFile,
+                zipfile.LargeZipFile,
+            ) as error:
+                fail(
+                    f"Could not verify existing artifact "
+                    f"{url}: {error}"
+                )
+
+            if remote_content_hash == local_content_hash:
+                return True
+
+    return False
+
+
+# ============================================================
 # Multipart upload
 # ============================================================
 
-def upload_version(api_url, token, project_id, version_number,
-                   versions, upload_file):
+def upload_version(
+    api_url,
+    token,
+    project_id,
+    version_number,
+    versions,
+    upload_file,
+):
     boundary = "----PythonModrinth" + uuid.uuid4().hex
 
     metadata = {
@@ -188,7 +402,7 @@ def upload_version(api_url, token, project_id, version_number,
         token,
         data=bytes(body),
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        timeout=300,
+        timeout=UPLOAD_TIMEOUT,
     )
 
 
@@ -241,21 +455,29 @@ def load_config():
 
     for version, pack_format in formats.items():
         if not isinstance(version, str):
-            fail("Minecraft version keys in datapack_formats must be strings.")
+            fail(
+                "Minecraft version keys in datapack_formats "
+                "must be strings."
+            )
 
         if (
             isinstance(pack_format, bool)
             or not isinstance(pack_format, (int, list))
-            or isinstance(pack_format, list)
-            and (
-                not pack_format
-                or any(
-                    isinstance(value, bool) or not isinstance(value, int)
-                    for value in pack_format
+            or (
+                isinstance(pack_format, list)
+                and (
+                    not pack_format
+                    or any(
+                        isinstance(value, bool) or not isinstance(value, int)
+                        for value in pack_format
+                    )
                 )
             )
         ):
-            fail(f"Invalid datapack format for Minecraft {version}: {pack_format}")
+            fail(
+                f"Invalid datapack format for Minecraft "
+                f"{version}: {pack_format}"
+            )
 
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -303,7 +525,9 @@ def create_build_list(config, formats):
             builds.append({
                 "index": index,
                 "format": pack_format,
-                "format_arg": json.dumps(pack_format, separators=(",", ":")),
+                "format_arg": json.dumps(
+                    pack_format, separators=(",", ":")
+                ),
                 "representative": representative,
                 "versions": versions,
                 "versions_text": ",".join(versions),
@@ -337,14 +561,22 @@ def build_one(build, config):
         build["representative"],
     ]
 
-    result = subprocess.run(
-        command,
-        cwd=str(BUILDER.parent),
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(BUILDER.parent),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    except OSError as error:
+        return {
+            "success": False,
+            "build": build,
+            "output": "",
+            "error": f"Could not start builder: {error}",
+        }
 
     output = result.stdout or ""
 
@@ -418,7 +650,9 @@ def fetch_versions(config, token, api_url, cache_dir):
                 fail(f"Invalid JSON returned for {project_id}: {error}")
 
             if not isinstance(versions, list):
-                fail(f"Unexpected versions response for project {project_id}.")
+                fail(
+                    f"Unexpected versions response for project {project_id}."
+                )
         else:
             fail(
                 f"Modrinth returned HTTP {status} for {project_id}:\n"
@@ -433,46 +667,16 @@ def fetch_versions(config, token, api_url, cache_dir):
             encoding="utf-8",
         )
 
-        print(f"Cached {project_name}")
+        print(f"Cached {project_name}: {len(versions)} existing version(s)")
 
     return cache
-
-
-# ============================================================
-# Check whether all versions already have this exact artifact
-# ============================================================
-
-def already_uploaded(existing_versions, game_versions, local_hash):
-    present = set()
-
-    for version in existing_versions:
-        if not isinstance(version, dict):
-            continue
-
-        version_games = version.get("game_versions", [])
-        if not isinstance(version_games, list):
-            continue
-
-        for file_info in version.get("files", []):
-            if not isinstance(file_info, dict):
-                continue
-
-            hashes = file_info.get("hashes", {})
-            if not isinstance(hashes, dict):
-                continue
-
-            if hashes.get("sha512") == local_hash:
-                for game_version in version_games:
-                    present.add(game_version)
-
-    return all(version in present for version in game_versions)
 
 
 # ============================================================
 # Upload one build
 # ============================================================
 
-def upload_one(build, local_hash, config, token, api_url):
+def upload_one(build, config, token, api_url):
     index = build["index"]
     project_name = config["PROJECT_NAMES"][index]
     project_id = config["PROJECT_IDS"][index]
@@ -517,10 +721,14 @@ def main():
     config, token, api_url, formats = load_config()
     builds = create_build_list(config, formats)
 
-    with tempfile.TemporaryDirectory(prefix="datapack-publisher-") as temp:
+    with tempfile.TemporaryDirectory(
+        prefix="datapack-publisher-"
+    ) as temp:
         temp_dir = Path(temp)
         cache_dir = temp_dir / "modrinth"
+        comparison_dir = temp_dir / "comparison"
         cache_dir.mkdir()
+        comparison_dir.mkdir()
 
         # ----------------------------------------------------
         # Build phase
@@ -566,7 +774,7 @@ def main():
                     print(
                         f"[DONE ] {project_name} "
                         f"{build['representative']} "
-                        f"(format {build['format']})"
+                        f"(format {format_id(build['format'])})"
                     )
                 else:
                     print(f"[ERROR] {project_name}: {result['error']}")
@@ -581,7 +789,6 @@ def main():
                 "No uploads were attempted."
             )
 
-        # Preserve the original build-list order for uploads.
         results_by_build = {
             id(result["build"]): result for result in results
         }
@@ -618,35 +825,58 @@ def main():
 
         for result in successful_builds:
             build = result["build"]
-            local_hash = result["hash"]
             index = build["index"]
             project_id = config["PROJECT_IDS"][index]
             project_name = config["PROJECT_NAMES"][index]
 
-            if already_uploaded(
-                cache[project_id],
-                build["versions"],
-                local_hash,
-            ):
-                print(f"[SKIP ] {project_name}")
-                print(f"        Format: {build['format']}")
-                print(f"        Versions: {build['versions_text']}")
-                skipped += 1
+            # Use a separate comparison directory for each build.
+            build_compare_dir = comparison_dir / (
+                f"{index}-{format_id(build['format'])}"
+            )
+
+            try:
+                if already_uploaded(
+                    cache[project_id],
+                    build["build"]["upload_file"],
+                    build_compare_dir,
+                ):
+                    print(f"[SKIP ] {project_name}")
+                    print(f"        Format: {build['format']}")
+                    print(f"        Versions: {build['versions_text']}")
+                    print("        Identical contents already published.")
+                    skipped += 1
+                    continue
+
+            except (
+                RuntimeError,
+                OSError,
+                urllib.error.URLError,
+                zipfile.BadZipFile,
+                zipfile.LargeZipFile,
+            ) as error:
+                print(
+                    f"[ERROR] Could not verify existing artifacts for "
+                    f"{project_name}: {error}"
+                )
+                failed_uploads.append(build)
                 continue
 
-            if upload_one(build, local_hash, config, token, api_url):
+            if upload_one(build, config, token, api_url):
                 uploaded += 1
 
-                # Update the in-memory cache so later builds for this
-                # project are checked against uploads made in this run.
+                # Record this upload in the cache so later builds can
+                # compare against it during this same run.
                 cache[project_id].append({
                     "game_versions": build["versions"],
                     "files": [{
-                        "hashes": {"sha512": local_hash}
+                        "url": None,
+                        "hashes": {
+                            "sha512": result["hash"],
+                        },
                     }],
                 })
             else:
-                failed_uploads.append((build, local_hash))
+                failed_uploads.append(build)
 
         # ----------------------------------------------------
         # Retry failed uploads once
@@ -660,10 +890,44 @@ def main():
             print("=" * 60)
             print(f"Uploads requiring retry: {len(failed_uploads)}")
 
-            for build, local_hash in failed_uploads:
-                print("\n[RETRY] Retrying upload...")
+            for build in failed_uploads:
+                print("\n[RETRY] Rechecking and retrying upload...")
 
-                if upload_one(build, local_hash, config, token, api_url):
+                index = build["index"]
+                project_id = config["PROJECT_IDS"][index]
+                project_name = config["PROJECT_NAMES"][index]
+
+                retry_compare_dir = comparison_dir / (
+                    f"retry-{index}-{format_id(build['format'])}"
+                )
+
+                try:
+                    if already_uploaded(
+                        cache[project_id],
+                        build["upload_file"],
+                        retry_compare_dir,
+                    ):
+                        print(
+                            f"[SKIP ] {project_name}: identical contents "
+                            "already published."
+                        )
+                        skipped += 1
+                        continue
+                except (
+                    RuntimeError,
+                    OSError,
+                    urllib.error.URLError,
+                    zipfile.BadZipFile,
+                    zipfile.LargeZipFile,
+                ) as error:
+                    print(
+                        f"[ERROR] Could not verify before retrying "
+                        f"{project_name}: {error}"
+                    )
+                    upload_failed += 1
+                    continue
+
+                if upload_one(build, config, token, api_url):
                     uploaded += 1
                 else:
                     upload_failed += 1
