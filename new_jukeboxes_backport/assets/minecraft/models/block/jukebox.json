@@ -1,9 +1,0 @@
-{
-	"parent": "minecraft:block/cube_top",
-	"textures": {
-		"bottom": "minecraft:block/jukebox_bottom",
-		"top": "minecraft:block/jukebox_top",
-		"side": "minecraft:block/jukebox_side",
-		"particle": "minecraft:block/jukebox_side"
-	}
-}
