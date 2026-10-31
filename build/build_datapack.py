@@ -78,18 +78,28 @@ def update_fabric_metadata(path, version):
     })
 
 
-def update_pack_metadata(path, pack_format):
-    data = load_json(path)
-    if not isinstance(data, dict):
-        fail("pack.mcmeta must contain a JSON object.")
+def generate_pack_metadata(path, project_name, version, pack_format):
+    description = (
+        f"{project_name}, for Minecraft Java {version} by Fiaguhop137"
+    )
 
-    pack = data.setdefault("pack", {})
-    if not isinstance(pack, dict):
-        fail("pack.mcmeta 'pack' must be a JSON object.")
+    if isinstance(pack_format, list):
+        metadata = {
+            "pack": {
+                "min_format": pack_format,
+                "max_format": pack_format,
+                "description": description,
+            }
+        }
+    else:
+        metadata = {
+            "pack": {
+                "pack_format": pack_format,
+                "description": description,
+            }
+        }
 
-    pack["min_format"] = pack_format
-    pack["max_format"] = pack_format
-    write_json(path, data)
+    write_json(path, metadata)
 
 
 def create_jar(source_dir, output_file):
@@ -132,7 +142,10 @@ def create_jar(source_dir, output_file):
 
 def main():
     if len(sys.argv) != 4:
-        fail("Usage: build_datapack.py <project_index> <pack_format_json> <minecraft_version>")
+        fail(
+            "Usage: build_datapack.py "
+            "<project_index> <pack_format_json> <minecraft_version>"
+        )
 
     try:
         index = int(sys.argv[1])
@@ -164,12 +177,14 @@ def main():
     if not source_dir.is_dir():
         fail(f"Source directory does not exist: {source_dir}")
 
-    for required in ("fabric.mod.json", "pack.mcmeta"):
-        if not (source_dir / required).is_file():
-            fail(f"Datapack requires {required}: {source_dir}")
+    if not (source_dir / "fabric.mod.json").is_file():
+        fail(f"Datapack requires fabric.mod.json: {source_dir}")
 
-    output_dir = Path(os.environ.get("MINECRAFT_BUILD_DIR", "/tmp/minecraft-builds"))
+    output_dir = Path(
+        os.environ.get("MINECRAFT_BUILD_DIR", "/tmp/minecraft-builds")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
+
     safe_name = project_name.replace("/", "_").replace(" ", "_")
     output_file = output_dir / f"{safe_name}-{format_id(pack_format)}.jar"
 
@@ -178,9 +193,21 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="datapack-build-") as temp:
         build_dir = Path(temp) / "build"
+
         shutil.copytree(source_dir, build_dir, symlinks=True)
-        update_fabric_metadata(build_dir / "fabric.mod.json", version)
-        update_pack_metadata(build_dir / "pack.mcmeta", pack_format)
+
+        update_fabric_metadata(
+            build_dir / "fabric.mod.json",
+            version,
+        )
+
+        generate_pack_metadata(
+            build_dir / "pack.mcmeta",
+            project_name,
+            version,
+            pack_format,
+        )
+
         create_jar(build_dir, output_file)
 
     print(f"Successfully built: {output_file}")
