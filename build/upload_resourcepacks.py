@@ -142,6 +142,20 @@ def download_archive_with_retries(url, destination):
                 raise RuntimeError(f"Could not download existing artifact: {error}") from error
             print(f"Download error: {error}. Retrying in 10 seconds.")
             time.sleep(10)
+def hash_archive(archive, destination):
+    destination.mkdir(parents=True, exist_ok=False)
+    extract_archive(archive, destination)
+    return hash_directory(destination)
+def download_retry(url, destination):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            download_archive(url, destination)
+            return
+        except (OSError, urllib.error.URLError) as exc:
+            destination.unlink(missing_ok=True)
+            if attempt == MAX_ATTEMPTS:
+                raise RuntimeError(f"Could not download artifact after {attempt} attempts: {exc}") from exc
+            time.sleep(10)
 def _already_uploaded(versions, archive, work):
     work.mkdir(parents=True, exist_ok=True)
     local_hash = sha512_file(archive)
