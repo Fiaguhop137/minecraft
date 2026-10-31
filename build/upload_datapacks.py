@@ -1,5 +1,4 @@
 #!/usr/bin/python3
-
 import concurrent.futures
 import hashlib
 import http.client
@@ -17,7 +16,6 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-
 CONFIG = Path("/home/firebot/git/minecraft/build/config.json")
 BUILDER = Path("/home/firebot/git/minecraft/build/build_datapack.py")
 BUILD_JOBS = 8
@@ -26,7 +24,6 @@ MAX_ATTEMPTS = 5
 TIMEOUT = 120
 UPLOAD_TIMEOUT = 300
 USER_AGENT = "Fiaguhop137-Datapack-Publisher/2.1"
-
 os.environ.update({
     "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
     "HOME": "/home/firebot",
@@ -34,36 +31,24 @@ os.environ.update({
     "LOGNAME": "firebot",
     "XDG_RUNTIME_DIR": "/run/user/1000",
 })
-
-
 def fail(message):
     raise RuntimeError(message)
-
-
 def load_json(path):
     try:
         with path.open(encoding="utf-8") as file:
             return json.load(file)
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"Cannot read {path}: {exc}")
-
-
 def format_id(value):
     return "-".join(map(str, value)) if isinstance(value, list) else str(value)
-
-
 def safe_name(value):
     return value.replace("/", "_").replace("\\", "_").replace(" ", "_")
-
-
 def sha512_file(path):
     digest = hashlib.sha512()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
 def request(method, url, token, data=None, headers=None, timeout=TIMEOUT):
     request_headers = {"Authorization": token, "User-Agent": USER_AGENT}
     request_headers.update(headers or {})
@@ -73,8 +58,6 @@ def request(method, url, token, data=None, headers=None, timeout=TIMEOUT):
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers), exc.read()
-
-
 def request_retry(method, url, token):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -100,8 +83,6 @@ def request_retry(method, url, token):
             continue
         return status, headers, body
     fail("Request retry loop ended unexpectedly.")
-
-
 def extract_archive(archive, destination):
     with zipfile.ZipFile(archive) as zipped:
         for info in zipped.infolist():
@@ -122,8 +103,6 @@ def extract_archive(archive, destination):
             target.parent.mkdir(parents=True, exist_ok=True)
             with zipped.open(info) as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
-
-
 def hash_directory(directory):
     digest = hashlib.sha512()
     for path in sorted(p for p in directory.rglob("*") if p.is_file()):
@@ -132,20 +111,14 @@ def hash_directory(directory):
         digest.update(relative)
         digest.update(bytes.fromhex(sha512_file(path)))
     return digest.hexdigest()
-
-
 def hash_archive(archive, destination):
     destination.mkdir(parents=True, exist_ok=False)
     extract_archive(archive, destination)
     return hash_directory(destination)
-
-
 def download_archive(url, destination):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output, length=1024 * 1024)
-
-
 def download_retry(url, destination):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -156,14 +129,12 @@ def download_retry(url, destination):
             if attempt == MAX_ATTEMPTS:
                 raise RuntimeError(f"Could not download artifact after {attempt} attempts: {exc}") from exc
             time.sleep(10)
-
-
 def _already_uploaded(versions, archive, work):
     work.mkdir(parents=True, exist_ok=True)
     local_hash = sha512_file(archive)
     local_contents = hash_archive(archive, work / "local")
     comparison_failures = []
-
+    comparisons = []
     for vi, version in enumerate(versions):
         if not isinstance(version, dict):
             continue
@@ -177,38 +148,66 @@ def _already_uploaded(versions, archive, work):
             if isinstance(hashes, dict) and hashes.get("sha512") == local_hash:
                 return True
             url = item.get("url")
-            if not isinstance(url, str) or not url.startswith("https://"):
-                continue
-            remote_zip = work / f"remote-{vi}-{fi}.zip"
-            remote_dir = work / f"remote-{vi}-{fi}"
-            print(f"        Comparing existing artifact {vi + 1}, file {fi + 1}...")
+            if isinstance(url, str) and url.startswith("https://"):
+                comparisons.append((vi, fi, url))
+    if not comparisons:
+        return False
+    def compare_one(vi, fi, url):
+        remote_zip = work / f"remote-{vi}-{fi}.zip"
+        remote_dir = work / f"remote-{vi}-{fi}"
+        try:
+            print(
+                f"        Comparing existing artifact {vi + 1}, "
+                f"file {fi + 1}..."
+            )
+            download_retry(url, remote_zip)
+            remote_contents = hash_archive(remote_zip, remote_dir)
+            return remote_contents == local_contents, None
+        except (
+            OSError,
+            RuntimeError,
+            urllib.error.URLError,
+            zipfile.BadZipFile,
+        ) as exc:
+            return False, f"{url}: {exc}"
+        finally:
+            remote_zip.unlink(missing_ok=True)
+            shutil.rmtree(remote_dir, ignore_errors=True)
+    # Second pass: compare archive contents concurrently.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(compare_one, vi, fi, url): (vi, fi)
+            for vi, fi, url in comparisons
+        }
+        for future in concurrent.futures.as_completed(futures):
             try:
-                download_retry(url, remote_zip)
-                if hash_archive(remote_zip, remote_dir) == local_contents:
-                    return True
-            except (OSError, RuntimeError, urllib.error.URLError, zipfile.BadZipFile) as exc:
-                comparison_failures.append(f"{url}: {exc}")
-            finally:
-                remote_zip.unlink(missing_ok=True)
-                shutil.rmtree(remote_dir, ignore_errors=True)
-
+                matched, error = future.result()
+            except Exception as exc:
+                matched = False
+                error = str(exc)
+            if error:
+                comparison_failures.append(error)
+            if matched:
+                # Cancel comparisons that haven't started yet.
+                for pending in futures:
+                    pending.cancel()
+                return True
     if comparison_failures:
         extra = len(comparison_failures) - 1
-        suffix = f" (and {extra} more comparison failure(s))" if extra else ""
+        suffix = (
+            f" (and {extra} more comparison failure(s))"
+            if extra else ""
+        )
         raise RuntimeError(
-            "Duplicate check incomplete; refusing to upload. First failure: "
-            f"{comparison_failures[0]}{suffix}"
+            "Duplicate check incomplete; refusing to upload. "
+            f"First failure: {comparison_failures[0]}{suffix}"
         )
     return False
-
-
 def already_uploaded(versions, archive, work):
     try:
         return _already_uploaded(versions, archive, work)
     finally:
         shutil.rmtree(work, ignore_errors=True)
-
-
 def upload_version(api_url, token, project_id, version_number, versions, archive):
     boundary = "----PythonModrinth" + uuid.uuid4().hex
     metadata = {
@@ -218,7 +217,7 @@ def upload_version(api_url, token, project_id, version_number, versions, archive
         "changelog": "Automated datapack release",
         "dependencies": [],
         "featured": False,
-        "loaders": ["minecraft"],
+        "loaders": ["fabric"],
         "game_versions": versions,
         "version_type": "release",
         "file_parts": ["file_payload"],
@@ -257,8 +256,6 @@ def upload_version(api_url, token, project_id, version_number, versions, archive
         return response.status, dict(response.getheaders()), response.read()
     finally:
         connection.close()
-
-
 def load_config():
     config = load_json(CONFIG)
     if not isinstance(config, dict):
@@ -295,8 +292,6 @@ def load_config():
         if not isinstance(fmt, (str, int, float, list, dict)):
             fail(f"Unsupported format value for Minecraft {version}: {fmt!r}")
     return config, token, api_url.rstrip("/"), formats
-
-
 def create_builds(config, formats, build_dir):
     groups = {}
     for version, fmt in formats.items():
@@ -327,8 +322,6 @@ def create_builds(config, formats, build_dir):
     if not builds:
         fail("No datapack projects are configured.")
     return builds
-
-
 def build_one(build, build_dir):
     env = os.environ.copy()
     env["MINECRAFT_BUILD_DIR"] = str(build_dir)
@@ -354,8 +347,6 @@ def build_one(build, build_dir):
                 "error": f"Builder failed (status {result.returncode}) or did not create {archive.name}."}
     return {"success": True, "build": build, "output": result.stdout or "",
             "hash": sha512_file(archive)}
-
-
 def fetch_versions(config, token, api_url, cache_dir):
     cache = {}
     for i, kind in enumerate(config["TYPE"]):
@@ -377,8 +368,6 @@ def fetch_versions(config, token, api_url, cache_dir):
         cache[project_id] = versions
         (cache_dir / f"{safe_name(project_id)}.json").write_text(json.dumps(versions), encoding="utf-8")
     return cache
-
-
 def upload_one(build, config, token, api_url):
     project_id = config["PROJECT_IDS"][build["index"]]
     version_number = datetime.now().strftime("%Y%m%d%H%M%S") + f"-{format_id(build['format'])}"
@@ -389,8 +378,6 @@ def upload_one(build, config, token, api_url):
         return True
     print(f"[ERROR] Upload HTTP {status}: {body.decode(errors='replace')}")
     return False
-
-
 def main():
     config, token, api_url, formats = load_config()
     if not BUILDER.is_file():
@@ -437,8 +424,6 @@ def main():
                 failed += 1
         print(f"Datapacks complete. Built: {len(results)}, uploaded: {uploaded}, skipped: {skipped}, failed: {failed}")
         return 1 if failed else 0
-
-
 if __name__ == "__main__":
     try:
         sys.exit(main())

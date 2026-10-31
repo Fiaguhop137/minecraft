@@ -1,12 +1,10 @@
 #!/usr/bin/python3
 """Build and publish configured Minecraft resource packs to Modrinth.
-
 Build output is discovered from the builder's own ``Output: ...`` line, rather
 than guessed from a second, potentially different output-directory setting.
 Archive comparisons are removed immediately after each comparison, uploads are
 streamed, and the temporary workspace is removed on success or failure.
 """
-
 import concurrent.futures
 import hashlib
 import json
@@ -24,7 +22,6 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-
 CONFIG = Path("/home/firebot/git/minecraft/build/config.json")
 BUILDER = Path("/home/firebot/git/minecraft/build/build_resourcepack.py")
 BUILD_JOBS = 8
@@ -32,7 +29,6 @@ MAX_ATTEMPTS = 5
 REQUEST_TIMEOUT = 120
 UPLOAD_TIMEOUT = 300
 CHUNK_SIZE = 1024 * 1024
-
 os.environ.update({
     "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
     "HOME": "/home/firebot",
@@ -40,36 +36,24 @@ os.environ.update({
     "LOGNAME": "firebot",
     "XDG_RUNTIME_DIR": "/run/user/1000",
 })
-
-
 def fail(message):
     raise RuntimeError(message)
-
-
 def format_id(pack_format):
     return "-".join(map(str, pack_format)) if isinstance(pack_format, list) else str(pack_format)
-
-
 def safe_name(name):
     return name.replace("/", "_")
-
-
 def sha512_file(path):
     digest = hashlib.sha512()
     with Path(path).open("rb") as stream:
         for chunk in iter(lambda: stream.read(CHUNK_SIZE), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
 def load_json(path):
     try:
         with Path(path).open("r", encoding="utf-8") as stream:
             return json.load(stream)
     except (OSError, json.JSONDecodeError) as error:
         fail(f"Could not read valid JSON from {path}: {error}")
-
-
 def request(method, url, token, data=None, headers=None, timeout=REQUEST_TIMEOUT):
     request_headers = {
         "Authorization": token,
@@ -83,8 +67,6 @@ def request(method, url, token, data=None, headers=None, timeout=REQUEST_TIMEOUT
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()
-
-
 def request_with_retries(method, url, token, timeout=REQUEST_TIMEOUT):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -104,8 +86,6 @@ def request_with_retries(method, url, token, timeout=REQUEST_TIMEOUT):
         print(f"Modrinth rate limit reached. Retrying in {wait_seconds}s...")
         time.sleep(wait_seconds)
     fail("Request retry loop ended unexpectedly.")
-
-
 def extract_archive(archive, destination):
     """Extract a ZIP while rejecting unsafe paths and special files."""
     destination = Path(destination)
@@ -130,8 +110,6 @@ def extract_archive(archive, destination):
             target.parent.mkdir(parents=True, exist_ok=True)
             with zipped.open(info) as source, target.open("wb") as output:
                 shutil.copyfileobj(source, output, length=CHUNK_SIZE)
-
-
 def hash_directory(directory):
     digest = hashlib.sha512()
     for path in sorted(p for p in Path(directory).rglob("*") if p.is_file()):
@@ -140,15 +118,11 @@ def hash_directory(directory):
         digest.update(relative)
         digest.update(bytes.fromhex(sha512_file(path)))
     return digest.hexdigest()
-
-
 def hash_archive_contents(archive, destination):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=False)
     extract_archive(archive, destination)
     return hash_directory(destination)
-
-
 def download_archive(url, destination):
     req = urllib.request.Request(url, headers={
         "User-Agent": "Fiaguhop137-ResourcePack-Publisher/1.0",
@@ -156,8 +130,6 @@ def download_archive(url, destination):
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
         with Path(destination).open("wb") as output:
             shutil.copyfileobj(response, output, length=CHUNK_SIZE)
-
-
 def download_archive_with_retries(url, destination):
     destination = Path(destination)
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -170,56 +142,87 @@ def download_archive_with_retries(url, destination):
                 raise RuntimeError(f"Could not download existing artifact: {error}") from error
             print(f"Download error: {error}. Retrying in 10 seconds.")
             time.sleep(10)
-
-
-def _already_uploaded(existing_versions, local_archive, cache_dir):
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    local_zip_hash = sha512_file(local_archive)
-    local_content_hash = hash_archive_contents(local_archive, cache_dir / "local-extracted")
-
-    for version_index, version in enumerate(existing_versions):
+def _already_uploaded(versions, archive, work):
+    work.mkdir(parents=True, exist_ok=True)
+    local_hash = sha512_file(archive)
+    local_contents = hash_archive(archive, work / "local")
+    comparison_failures = []
+    comparisons = []
+    # First pass: exact SHA-512 matches require no downloads.
+    for vi, version in enumerate(versions):
         if not isinstance(version, dict):
             continue
         files = version.get("files", [])
         if not isinstance(files, list):
             continue
-        for file_index, file_info in enumerate(files):
-            if not isinstance(file_info, dict):
+        for fi, item in enumerate(files):
+            if not isinstance(item, dict):
                 continue
-            url = file_info.get("url")
-            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-                continue
-            hashes = file_info.get("hashes", {})
-            if not isinstance(hashes, dict):
-                hashes = {}
-            if hashes.get("sha512") == local_zip_hash:
+            hashes = item.get("hashes") or {}
+            if isinstance(hashes, dict) and hashes.get("sha512") == local_hash:
                 return True
-
-            remote_zip = cache_dir / f"remote-{version_index}-{file_index}.zip"
-            remote_extract = cache_dir / f"remote-{version_index}-{file_index}-extracted"
-            print(f"        Comparing existing artifact {version_index + 1}, file {file_index + 1}...")
+            url = item.get("url")
+            if isinstance(url, str) and url.startswith("https://"):
+                comparisons.append((vi, fi, url))
+    if not comparisons:
+        return False
+    def compare_one(vi, fi, url):
+        remote_zip = work / f"remote-{vi}-{fi}.zip"
+        remote_dir = work / f"remote-{vi}-{fi}"
+        try:
+            print(
+                f"        Comparing existing artifact {vi + 1}, "
+                f"file {fi + 1}..."
+            )
+            download_retry(url, remote_zip)
+            remote_contents = hash_archive(remote_zip, remote_dir)
+            return remote_contents == local_contents, None
+        except (
+            OSError,
+            RuntimeError,
+            urllib.error.URLError,
+            zipfile.BadZipFile,
+        ) as exc:
+            return False, f"{url}: {exc}"
+        finally:
+            remote_zip.unlink(missing_ok=True)
+            shutil.rmtree(remote_dir, ignore_errors=True)
+    # Second pass: compare archive contents concurrently.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(compare_one, vi, fi, url): (vi, fi)
+            for vi, fi, url in comparisons
+        }
+        for future in concurrent.futures.as_completed(futures):
             try:
-                download_archive_with_retries(url, remote_zip)
-                remote_content_hash = hash_archive_contents(remote_zip, remote_extract)
-            except (
-                OSError, RuntimeError, urllib.error.URLError,
-                zipfile.BadZipFile, zipfile.LargeZipFile,
-            ) as error:
-                fail(f"Could not verify existing artifact {url}: {error}")
-            if remote_content_hash == local_content_hash:
+                matched, error = future.result()
+            except Exception as exc:
+                matched = False
+                error = str(exc)
+            if error:
+                comparison_failures.append(error)
+            if matched:
+                # Cancel comparisons that haven't started yet.
+                for pending in futures:
+                    pending.cancel()
                 return True
+    if comparison_failures:
+        extra = len(comparison_failures) - 1
+        suffix = (
+            f" (and {extra} more comparison failure(s))"
+            if extra else ""
+        )
+        raise RuntimeError(
+            "Duplicate check incomplete; refusing to upload. "
+            f"First failure: {comparison_failures[0]}{suffix}"
+        )
     return False
-
-
 def already_uploaded(existing_versions, local_archive, cache_dir):
     """Always remove extracted files and downloaded archives after comparison."""
     try:
         return _already_uploaded(existing_versions, local_archive, cache_dir)
     finally:
         shutil.rmtree(cache_dir, ignore_errors=True)
-
-
 def upload_version(api_url, token, project_id, version_number, version_name, game_versions, archive):
     """Send multipart data while streaming the ZIP instead of buffering it in RAM."""
     boundary = "----PythonModrinth" + uuid.uuid4().hex
@@ -249,24 +252,20 @@ def upload_version(api_url, token, project_id, version_number, version_name, gam
     suffix = f"\r\n--{boundary}--\r\n".encode()
     archive = Path(archive)
     content_length = len(prefix) + archive.stat().st_size + len(suffix)
-
     # urllib supports file-like request bodies with a known Content-Length.
     class MultipartBody:
         def __init__(self, file_path):
             self.file_path = Path(file_path)
             self.parts = (prefix, suffix)
             self.length = content_length
-
         def __len__(self):
             return self.length
-
         def __iter__(self):
             yield prefix
             with self.file_path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(CHUNK_SIZE), b""):
                     yield chunk
             yield suffix
-
         def read(self, amount=-1):
             # urllib's HTTP handler may call read(); provide bounded streaming.
             if not hasattr(self, "_iterator"):
@@ -284,7 +283,6 @@ def upload_version(api_url, token, project_id, version_number, version_name, gam
                     break
             result, self._buffer = self._buffer[:amount], self._buffer[amount:]
             return result
-
     body = MultipartBody(archive)
     return request(
         "POST",
@@ -295,8 +293,6 @@ def upload_version(api_url, token, project_id, version_number, version_name, gam
                  "Content-Length": str(content_length)},
         timeout=UPLOAD_TIMEOUT,
     )
-
-
 def load_config():
     if not CONFIG.is_file():
         fail(f"config.json not found: {CONFIG}")
@@ -333,8 +329,6 @@ def load_config():
         ):
             fail(f"Invalid resource-pack format for Minecraft {version}: {pack_format}")
     return config, token, api_url.rstrip("/"), formats
-
-
 def create_build_list(config, formats, build_dir):
     print("\nCreating grouped build list...")
     grouped = {}
@@ -343,7 +337,6 @@ def create_build_list(config, formats, build_dir):
         if key not in grouped:
             grouped[key] = {"format": pack_format, "versions": [], "representative": version}
         grouped[key]["versions"].append(version)
-
     builds = []
     for index, project_type in enumerate(config["TYPE"]):
         if project_type != "resourcepack":
@@ -367,11 +360,7 @@ def create_build_list(config, formats, build_dir):
     if not builds:
         fail("No resource-pack projects are configured.")
     return builds
-
-
 OUTPUT_LINE = re.compile(r"^\s*Output:\s*(.+?)\s*$", re.MULTILINE)
-
-
 def build_one(build, config, workspace):
     """Run the builder and use the exact archive path it reports."""
     index = build["index"]
@@ -389,28 +378,23 @@ def build_one(build, config, workspace):
         )
     except OSError as error:
         return {"success": False, "build": build, "output": "", "error": f"Could not start builder: {error}"}
-
     output = result.stdout or ""
     match = OUTPUT_LINE.search(output)
     reported_archive = Path(match.group(1)).expanduser() if match else None
-
     if result.returncode != 0:
         return {"success": False, "build": build, "output": output,
                 "error": f"Builder exited with status {result.returncode}."}
     if reported_archive is None:
         return {"success": False, "build": build, "output": output,
                 "error": "Builder succeeded but did not report an 'Output: /path/to/archive.zip' line."}
-
     try:
         reported_archive = reported_archive.resolve(strict=True)
     except OSError:
         return {"success": False, "build": build, "output": output,
                 "error": f"Builder reported an archive that does not exist: {reported_archive}"}
-
     if not reported_archive.is_file():
         return {"success": False, "build": build, "output": output,
                 "error": f"Builder reported an output that is not a file: {reported_archive}"}
-
     # build_resourcepack.py currently writes to /tmp/minecraft-builds instead
     # of honoring the caller's temporary workspace. Move the completed archive
     # into this run's private workspace so later cleanup is reliable.
@@ -423,15 +407,12 @@ def build_one(build, config, workspace):
     except OSError as error:
         return {"success": False, "build": build, "output": output,
                 "error": f"Could not move builder output into the temporary workspace: {error}"}
-
     build["archive"] = reported_archive
     try:
         digest = sha512_file(reported_archive)
     except OSError as error:
         return {"success": False, "build": build, "output": output, "error": f"Could not hash {reported_archive}: {error}"}
     return {"success": True, "build": build, "output": output, "hash": digest}
-
-
 def fetch_versions(config, token, api_url, cache_dir):
     print("\n" + "=" * 60 + "\nFETCHING EXISTING MODRINTH VERSIONS\n" + "=" * 60)
     cache = {}
@@ -456,8 +437,6 @@ def fetch_versions(config, token, api_url, cache_dir):
         (cache_dir / f"{project_id}.json").write_text(json.dumps(versions, indent=2), encoding="utf-8")
         print(f"Cached {project_name}: {len(versions)} existing version(s)")
     return cache
-
-
 def upload_one(build, config, token, api_url):
     index = build["index"]
     project_name = config["PROJECT_NAMES"][index]
@@ -480,8 +459,6 @@ def upload_one(build, config, token, api_url):
     print(f"[ERROR] Failed to upload {project_name} format {pack_format_id}: HTTP {status}")
     print(body.decode("utf-8", errors="replace"))
     return False
-
-
 def main():
     config, token, api_url, formats = load_config()
     with tempfile.TemporaryDirectory(prefix="resourcepack-publisher-") as temp:
@@ -493,7 +470,6 @@ def main():
         cache_dir.mkdir()
         comparison_dir.mkdir()
         builds = create_build_list(config, formats, build_dir)
-
         print("\n" + "=" * 60 + "\nBUILD PHASE\n" + "=" * 60)
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=BUILD_JOBS) as executor:
@@ -512,21 +488,17 @@ def main():
                 else:
                     print(f"[ERROR] {project_name}: {result['error']}")
                 results.append(result)
-
         failed_builds = [result for result in results if not result["success"]]
         if failed_builds:
             fail(f"{len(failed_builds)} build(s) failed. No uploads were attempted.")
-
         results_by_id = {id(result["build"]): result for result in results}
         successful_builds = [results_by_id[id(build)] for build in builds]
         print("\n" + "=" * 60 + "\nBUILD PHASE COMPLETE\n" + "=" * 60)
         print(f"Unique builds: {len(successful_builds)} / {len(builds)}")
-
         cache = fetch_versions(config, token, api_url, cache_dir)
         print("\n" + "=" * 60 + "\nUPLOAD PHASE\n" + "=" * 60)
         uploaded = skipped = upload_failed = 0
         failed_uploads = []
-
         for result in successful_builds:
             build = result["build"]
             index = build["index"]
@@ -551,7 +523,6 @@ def main():
                 })
             else:
                 failed_uploads.append(build)
-
         if failed_uploads:
             print("\n" + "=" * 60 + "\nRETRYING FAILED UPLOADS\n" + "=" * 60)
             print(f"Uploads requiring retry: {len(failed_uploads)}")
@@ -574,14 +545,12 @@ def main():
                     uploaded += 1
                 else:
                     upload_failed += 1
-
         print("\nCleaning generated ZIPs...")
         for archive in build_dir.glob("*.zip"):
             try:
                 archive.unlink(missing_ok=True)
             except OSError as error:
                 print(f"[WARNING] Could not delete {archive}: {error}")
-
         print("\n" + "=" * 60 + "\nALL RESOURCE PACKS PROCESSED\n" + "=" * 60)
         print(f"Minecraft versions: {len(formats)}")
         print(f"Unique builds:      {len(successful_builds)}")
@@ -590,8 +559,6 @@ def main():
         print(f"Failed:             {upload_failed}")
         print("=" * 60)
         return 1 if upload_failed else 0
-
-
 try:
     sys.exit(main())
 except (RuntimeError, OSError, urllib.error.URLError) as error:
