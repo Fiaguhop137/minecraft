@@ -1,0 +1,3 @@
+nohup: ignoring input
+Error: Modrinth returned HTTP 404 for project I5gjjnuK. Check PROJECT_IDS; refusing to treat a missing project as empty.
+Error: Command ['/home/firebot/git/minecraft/build/upload_datapacks.py'] returned non-zero exit status 1.

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -42,6 +43,13 @@ def format_id(value):
     return "-".join(map(str, value)) if isinstance(value, list) else str(value)
 
 
+def make_mod_id(project_name):
+    mod_id = re.sub(r"[^a-z0-9_-]+", "_", project_name.lower()).strip("_")
+    if not mod_id or not mod_id[0].isalpha():
+        mod_id = f"datapack_{mod_id}"
+    return mod_id[:64]
+
+
 def validate_format(value):
     if type(value) is int and value >= 0:
         return
@@ -54,27 +62,19 @@ def validate_format(value):
     fail("Pack format must be a non-negative integer or a two-integer array.")
 
 
-def update_fabric_metadata(path, version):
-    data = load_json(path)
-    if not isinstance(data, dict):
-        fail("fabric.mod.json must contain a JSON object.")
-
-    depends = data.get("depends") or {}
-    if not isinstance(depends, dict):
-        fail("fabric.mod.json 'depends' must be a JSON object.")
-
-    depends = dict(depends)
-    depends["minecraft"] = ">=" + version
-
+def generate_fabric_metadata(path, project_name, version):
     write_json(path, {
-        "schemaVersion": data.get("schemaVersion", 1),
-        "id": data.get("id"),
+        "schemaVersion": 1,
+        "id": make_mod_id(project_name),
         "version": version,
-        "name": data.get("name"),
-        "environment": data.get("environment", "*"),
-        "depends": depends,
-        "entrypoints": data.get("entrypoints", {}),
-        "mixins": data.get("mixins", []),
+        "name": project_name,
+        "description": f"{project_name}, for Minecraft Java {version} by Fiaguhop137",
+        "authors": ["Fiaguhop137"],
+        "environment": "*",
+        "depends": {
+            "minecraft": ">=" + version,
+            "fabric-resource-loader-v0": "*"
+        },
     })
 
 
@@ -177,9 +177,6 @@ def main():
     if not source_dir.is_dir():
         fail(f"Source directory does not exist: {source_dir}")
 
-    if not (source_dir / "fabric.mod.json").is_file():
-        fail(f"Datapack requires fabric.mod.json: {source_dir}")
-
     output_dir = Path(
         os.environ.get("MINECRAFT_BUILD_DIR", "/tmp/minecraft-builds")
     )
@@ -196,8 +193,9 @@ def main():
 
         shutil.copytree(source_dir, build_dir, symlinks=True)
 
-        update_fabric_metadata(
+        generate_fabric_metadata(
             build_dir / "fabric.mod.json",
+            project_name,
             version,
         )
 
