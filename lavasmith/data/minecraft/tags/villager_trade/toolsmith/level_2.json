@@ -1,6 +1,4 @@
 {
-  "replace": false,
-  "values": [
-    "lavasmith:lava_bucket"
-  ]
+    "replace":false,
+    "values":["lavasmith:lava_bucket"]
 }
